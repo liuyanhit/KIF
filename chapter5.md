@@ -115,3 +115,209 @@ The connection to the server 10.111.249.153 was refused – did you
 重温一下在运行命令期间发生了什么。图5.3显示了事件的顺序。在一个pod容器上，利用kubernetes去执行curl命令。Curl向service iP发送出一个HTTP请求，service后面三个pod做支撑，kubernetes service 代理截取的该连接，在三个pod中任意选择了一个pod，之后将请求转发给它。在pod中运行的Node js处理请求，并返回带有pod名称的HTPP应答。Curl接收应答并向标准的输出打印，然而应答也kubectl被截取，打印在本地机器的标准输出上。
 
 ![图 5.3 使用kubectl exec其中一个容器中运行`curl`来测试与服务的连接](figures/Figure5.3.png )
+
+在之前的例子上，你以独立进程的方式执行了curl命令，但是只是在pod最重要的容器中。这和容器中实际上的主进程service传输信息并没有什么区别。
+
+**在service上配置session affinity**
+
+如果多次执行同样的命令，每次调用执行可能是在不同的pod上。但是如下清单一样，可以将service的sessionAffinity属性设置为ClientIP（而不是None ，None是默认值）来避免此情况的发生。
+
+代码清单5.2 sessionAffinity被设置成ClientIP的service的例子
+
+```
+apiVersion: v1
+kind: Service
+spec:
+  sessionAffinity: ClientIP
+...
+```
+
+这种方式将会使service proxy将来自同一个client ip地址的所有请求转发至同一个pod上。作为练习，创建额外的service并将session affinity设置为ClientIP,并尝试向其发送请求。
+
+kubernetes仅仅支持两种形式的service session affinity：None和ClientIP。或许惊讶竟然不支持基于cookie的session affinity的选项，但是你要了解到kubernetes service不是在http层面上工作。Service处理TCP和UDP包，并不关心其中的载荷内容。因为cookie是http协议中的一部分，service并不知道他们，这就解释了为什么session affinity不能基于cookie。
+
+**同一个service使用多个端口**
+
+你创建的service使用（expose）一个端口，但是service也支持多个端口。比如，你的pod监听两个端口，比如说HTTP的8080和HTTPS的8443，你可以使用一个service从端口80和443转发至pod端口8080和8443。在这种情况下，不需要创建两个不同的服务。通过一个集群IP，在使用一个多端口的service就可以将服务的多个端口全部暴露出来。
+
+> **注意**
+> 在创建一个有多个端口的service的时候，必须指定多个端口的名字。
+
+以下列表中显示了支持多端口的service spec：
+代码清单5.3 在service定义中指定多端口
+
+```
+apiVersion: v1
+kind: Service
+metadata:
+name: kubia
+spec: ports:
+  - name: http
+    port: 80                    <-------
+    targetPort: 8080            <-------pod的端口8080映射成端口80
+  - name: https
+    port: 443                   <-------
+    targetPort: 8443            <-------pod的端口8443映射成端口443
+  selector:
+app: kubia                      <-------label selector适用于整个servcie
+```
+
+> **注意**
+>  label selector应用于整个service，不能对每个端口做单独的配置。如果不同的pod有不同的端口映射关系，需要创建两个service
+
+之前创建的kubia pod不在多个端口上侦听，因此可以练习创建一个多端口service和一个多端口pod。
+
+**使用命名端口**
+
+在这些例子里，通过数字来指定端口，但是在service spec里也可以给不同的端口号命名，通过名称来指定。这样对一些不是众所周知的端口号的情况下，使得service spec更加清楚。
+举个例子，假设你的pod端口定义命名如下表所示：
+
+代码清单5.4 在pod的定义中指定port名称
+
+```
+kind: Pod
+spec:
+  containers:
+  - name: kubia
+    ports:
+    - name: http
+      containerPort: 8080        <-------端口8080被命名为http
+    - name: https
+      containerPort: 8443        <-------端口8443被命名为https
+```
+可以在service spec中按名称引用这些端口，如下面清单所示：
+
+代码清单5.5 在service中引用命名pod
+
+```
+apiVersion: v1
+kind: Service
+spec:
+  ports:
+  - name: http
+port: 80
+    targetPort: http             <-------将端口80映射到容器中被称为http的端口
+  - name: https
+    port: 443
+    targetPort: https            <-------将端口443映射到容器中被称为https的端口
+Port 80 is mapped to the container’s port called http.
+Port 443 is mapped to the container’s port, whose name is https.
+```
+
+为什么要采用命名端口的方式？最大的好处就是即使更换端口号也无需更改service spec。你的pod现在对http服务用的是8080，但是假设过段时间你决定将端口更换为80呢？
+
+但是如果你采用了命名的端口，你仅仅需要做的就是改变pod spec中的端口号（当然你的端口号的名字没有改变）。在你的pod向新端口更新时，根据pod收到的连接(端口8080在旧的pod上，端口80在新的pod上)，用户连接将会转发到对应的端口号上。
+
+##5.1.2 发现服务
+
+通过创建service，现在就可以通过个单一稳定的IP地址访问到pod。在service整个生命周期内这个地址保持不变。在service后面的pod可能消失重建，他们的IP地址可能改变，数量也会增减，但是始终可以通过service的单一不变的IP地址访问到这些pod。
+
+但客户端pod如何知道service的IP和端口？是否需要先创建服务，然后手动查找其IP地址并将IP传递给客户端pod的配置选项？当然不。 Kubernetes还为客户端提供了发现service的IP和端口的方式。
+
+**通过环境变量发现服务**
+
+在pod开始运行的时候，kubernetes会初始化一系列的环境变量指向现在存在的service。如果你创建service早于客户端pod的创建，pod上的进程可以根据环境变量获得service的IP地址和端口号。
+
+在一个运行pod上检查环境，去了解这些环境变量。现在已经了解了通过`kubectl exec`命令在pod上运行一个命令，但是由于service的创建晚于pod的创建的，那么关于这个service的环境变量并没有设置，这个问题也需要被解决。
+
+在查看service的环境变量之前，首先需要删除掉所有的pod使得replicationcontroller创建全新的pod。在无需知道pod的名字的情况下就能删除所有的pod，就像这样：
+
+```
+$ kubectl delete po --all
+pod "kubia-7nog1" deleted
+pod "kubia-bf50t" deleted
+pod "kubia-gzwli" deleted
+```
+现在列出所有新的pod(确信大家知道如何操作)，然后选择一个作为`kubectl exec`命令的执行目标。一旦选择了目标pod，通过在容器里运行`env`来列出来所有的环境变量，如下表所示。
+
+代码清单5.6 容器中和service相关的环境变量
+
+```
+$ kubectl exec kubia-3inly env
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+HOSTNAME=kubia-3inlyKUBERNETES_SERVICE_HOST=10.111.240.1 
+KUBERNETES_SERVICE_PORT=443
+... 
+KUBIA_SERVICE_HOST=10.111.249.153 
+KUBIA_SERVICE_PORT=80
+...
+Here’s the cluster IP of the service.
+And here’s the port the service is available on.
+```
+在cluster中定义了两个service：`kubernetes`和`kubia`服务（之前在用`kubectl get svc`命令的时候应该见过）；所以，列表中显示了和这两个service相关的环境变量。在本章开始部分，创建了`kubia` service，在和其有关的环境变量中有KUBIA_SERVICE _HOST 和KUBIA_SERVICE_PORT ，分别代表了`kubia` service的IP地址和端口号。 
+
+回顾本章开始部分的前端-后端的例子，当前端pod需要后端数据库服务pod，可以通过名为`backend-database`的service将后端pod显露(expose)出来，然后前端pod通过环境变量BACKEND\_DATABASE\_SERVICE\_HOST 和 BACKEND\_DATABASE\_SERVIC\E_PORT去获得IP地址和端口信息。
+> **注意**
+> 服务名称中的破折号被转换为下划线，并且当服务名称用作环境变量名称中的前缀时，所有的字母都是大写的。
+
+环境变量是获得service IP地址和端口号的一种方式，为什么不用DNS域名？为什么kubernetes中没有DNS服务器，并允许通过DNS来获得所有service的IP地址？事实证明，它的确如此！
+
+**通过DNS发现service**
+
+还记得第三章中在`kube-system`命名空间下列出的所有pod的名字吗？其中一个pod被称作`kube-dns`，当前的`kube-system`的命名空间中中也包含了一个具有相同名字的响应service。
+
+就像名字的暗示，这个pod运行DNS服务，在集群中的其他pod都被配置成使用其作为dns（kubernetes通过修改每个容器的`/etc/resolv.conf`文件实现）。运行在pod上的进程DNS查询都会被kubernetes自身的DNS server响应，该服务器知道系统中运行的所有service。
+
+> **注意**
+> pod是否使用内部的DNS服务器是根据pod spec中`dnsPolicy`属性来决定的
+
+每个service从内部DNS server中获得一个DNS条目，客户端的pod在知道service名字的情况下可以通过全限定域名（FQDN）来访问,而不是诉诸于环境变量。
+
+**通过FQDN连接服务**
+
+再次回顾前端-后端的例子，前端pod可以通过打开到以下FQDN的连接来访问后端数据库服务：
+
+`backend-database.default.svc.cluster.local`
+
+`backend-database`对应于服务名称，`default`表示服务在其中定义的名称空间，而`svc.cluster.local`是在所有集群本地服务名称中使用的可配置集群域后缀。
+> **注意**
+> 客户端仍然必须知道service的端口号。如果service使用标准端口号（例如 http的80端口，Postgres的5432端口），这样是没问题的。如果并不是标准端口，客户端可以从环境变量中获取端口号。
+
+连接一个service可能比这更简单。如果前端pod和数据库pod在同一个命名空间下，你可以省略`svc.cluster.local`后缀，甚至命名空间。因此你可以使用`backend-database`来指代service。这是不可思议的简单，不是吗？
+
+尝试一下。尝试使用FQDN来代替IP去访问`kubia`service。另外，必须在一个存在的pod上才能这样做。已经知道通过`kubectl exec`在一个pod的容器上去执行一个简单的命令。但是这一次不是直接的使用`curl`命令，而是使用`bash`shell，这样的话，可以在容器上运行多条命令。在第二章中，当想进入容器时，启动docker时调用`docker exec -it bash`命令，这与此很相似。
+
+**在pod容器上运行shell**
+
+可以通过`kubectl exec`命令在一个pod容器上运行`bash`（或者其他形式的shell）。通过这种方式，可以随意浏览容器，而无需为每个要运行的命令执行`kubectl exec`。
+> **注意**
+> shell的二进制可执行文件必须在容器映像中可用才能使用。
+
+为了正常的使用shell，`kubectl exec`需要-it选项
+
+```
+$ kubectl exec -it kubia-3inly bash
+root@kubia-3inly:/#
+```
+这样的话就处于container内部，根据下述的任何一种方式使用`curl`命令来访问`kubia`service
+
+```
+root@kubia-3inly:/# curl http://kubia.default.svc.cluster.local
+You’ve hit kubia-5asi2
+root@kubia-3inly:/# curl http://kubia.default
+You’ve hit kubia-3inly
+root@kubia-3inly:/# curl http://kubia
+You’ve hit kubia-8awf3
+```
+
+在请求的URL中，可以将service的名称作为主机名来访问service。因为根据每个pod容器DNS解析器配置的方式，可以将命名空间和`svc.cluster.local`后缀省略掉。查看一下容器内的`/etc/resilv.conf`文件就明白了。
+
+```
+root@kubia-3inly:/# cat /etc/resolv.conf
+search default.svc.cluster.local svc.cluster.local cluster.local ...
+```
+
+**理解ping不通service的IP**
+
+在继续之前还有最后一问题。了解了如何创建service，所以很快的去自己创建一个。但是，不知道任何原因，无法访问创建的service？
+
+大家可能会尝试通过进入现有的pod，并尝试像上一个示例中那样访问该service来找出问题所在。然后，如果仍然无法使用简单的`curl`命令访问service，也许会尝试ping service IP以查看service是否已启动。现在来尝试一下:
+
+```
+root@kubia-3inly:/# ping kubia
+PING kubia.default.svc.cluster.local (10.111.249.153): 56 data bytes
+^C--- kubia.default.svc.cluster.local ping statistics ---
+54 packets transmitted, 0 packets received, 100% packet loss
+```
+
+嗯，curl这个service是工作的，但是却ping不通。这是因为service的集群IP是一个虚拟IP，并且只有在与service端口结合时才有意义。将在第11章中解释这意味着什么以及服务是如何工作的。在这里提到这一点，这是因为用户疏于警惕,在尝试调试异常的服务时所做的第一件事。
