@@ -321,3 +321,116 @@ PING kubia.default.svc.cluster.local (10.111.249.153): 56 data bytes
 ```
 
 嗯，curl这个service是工作的，但是却ping不通。这是因为service的集群IP是一个虚拟IP，并且只有在与service端口结合时才有意义。将在第11章中解释这意味着什么以及服务是如何工作的。在这里提到这一点，这是因为用户疏于警惕,在尝试调试异常的服务时所做的第一件事。
+##5.2 访问集群外部的service
+
+到现在为止，讨论了由集群内运行的一个或多个pod支持的service。但是还有另外一种情况的发生，就是想通过Kubernetes service功能访问（expose）外部service。不要让service将连接重定向到集群中的pod，而是希望它重定向到外部IP和端口。
+
+这样做可以让充分利用服务负载平衡和服务发现。在集群中运行的客户端pod可以像连接到内部服务一样连接到外部服务。
+##5.2.1 介绍service endpoint
+
+在进入如何做到这一点之前，先阐述一下service。service并不是和pod直接相连。相反，有一种资源介于两者之间—它就是Endpoint 资源。如果之前在service上运行过`kubectl describe`，可能已经了解到endpoint，如下表所示
+
+代码清单5.7 用kubectl describe展示service的全部细节
+
+```
+Name:               kubia
+Namespace:          default
+Labels:             <none>
+Selector:           app=kubia                                             <-------用于创建endpoint列表的service pod selector                                      
+Type:               ClusterIP
+IP:                 10.111.249.153
+Port:               <unset> 80/TCP
+Endpoints:          10.108.1.4:8080,10.108.2.5:8080,10.108.2.6:8080       <-------代表service endpoint的pod的IP和端口列表
+Session Affinity:        None
+No events.
+```
+
+Endpoint资源就是暴露一个服务的IP地址和端口的列表，endpoint资源和kubernetes其他资源一样，所以可以使用`kubectl info`来获取它的基本信息。
+
+```
+$ kubectl get endpoints kubia
+NAME    ENDPOINTS                                         AGE
+kubia   10.108.1.4:8080,10.108.2.5:8080,10.108.2.6:8080   1h
+```
+尽管在service spec中定义了pod selector，但在重定向传入连接时不会直接使用它。相反，selector用于构建IP和端口列表，然后存储在endpoint资源中。当客户端连接到服务时，服务代理选择这些IP和端口对中的一个，并将传入连接重定向到在该位置监听的服务器。
+
+##5.2.2 手动配置service endpoint
+
+或许已经意识到这一点，service endpoint与service解耦后，可以分别的手动配置和更新它们。
+
+如果创建了不包含pod selector的service，Kubernetes将不会创建endpoint资源（毕竟，缺少selector，将不会知道service中包含哪些pods）。这样就需要创建endpoint资源来指定该service的endpoint列表。
+
+要使用手动配置endpoints的方式创建service，需要创建service和endpoint资源。
+ 
+**创建无selector的service**
+ 
+首先为service创建一个YAML文件，如下表所示
+
+代码清单5.8 不含pod selector的service：external-service.yaml
+
+```
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-service       <------service 的名字必须和endpoint的宁子相匹配
+spec:
+  ports:                       <------service中没有定义selector
+  - port: 80
+```
+
+定义一个名为external-service的服务，它将接受端口80上的传入连接。并没有为service定义一个pod selector。
+
+**为缺少selector的service创建endpoint资源**
+
+Endpoint 是一个单独的资源并不是service的一个属性。由于创建的资源中并不包含selector，相关的endpoint资源并没有自动的创建，所以必须额外来创建。下表列出了YAML manifest。
+
+代码清单5.9 手动创建endpoint资源：external-service-endpoints.yaml
+
+```
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: external-service            <--------endpoint的名字必须和service的名字像匹配（见之前的代码清单）
+subsets:
+  - addresses:
+    - ip: 11.11.11.11               <--------service将连接重定向到endpoint的IP地址
+    - ip: 22.22.22.22
+    ports:
+    - port: 80                      <--------endpoint的目标端口
+```
+
+Endpoints对象需要与service具有相同的名称，并包含该service的目标IP地址和端口列表。service和endpoing资源都发布到服务器后，这样service就可以像具有pod selector那样的service正常使用。在service创建后创建的容器将包含service的环境变量，并且与其IP:port对的所有连接都将在服务端点之间进行负载均衡。
+
+图5.4显示了三个pod连接到具有外部endpoint的service
+
+![图 5.4 pod使用（consuming）具有两个外部endpoint的service上](figures/Figure5.4.png )
+
+如果稍后决定将外部servicee迁移到Kubernetes内运行的pod，为service添加selector，从而对endpoint进行自动管理。反过来也是一样的--将selector从service中移除，kubernetes将停止更新endpoint。这意味着service的IP地址可以保持不变，同时service的实际实现却发生了改变。
+
+##5.2.3 为外部的service创建别名 
+
+除了手动配置service的endpoint来代替公开外部service方法之外，有种更简单的方法就是通过其完全限定域名（FQDN）访问外部service 
+
+**创建一个外部名称的service**
+
+要创建一个具有别名的外部服务的service时，要将创建service资源的一个`type`字段设置为`ExternalName`。例如。设想下在api.somecompany.com有公共可用的API。可以定义一个指向它的服务，如下面的清单所示。
+
+代码清单5.10 type是ExternalName的service：external-service-externalname.yaml
+
+```
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-service
+spec:
+  type: ExternalName                         <-------service的type被设置成ExternalName
+  externalName: someapi.somecompany.com      <-------实际服务的完全限定域名
+  ports:
+  - port: 80
+```
+
+service创建完成后，pod可以通过`external-service.default.svc.cluster.local`域名（甚至是`external-service`）连接到外部服务，而不是使用服务的实际FQDN。这隐藏了实际的service名称及其使用该服务的pod的位置，允许修改service定义，并且在以后如果将其指向不同的service，只是简单的修改`externalName`属性或者将类型重新变回`ClusterIP`并为service创建endpoint—无论是手动创建，或者对service上指定label selector使其自动的创建。
+
+`ExternalName` service仅在DNS级别实施 - 为service创建了简单的CNAME DNS记录。因此，连接到服务的客户端将直接连接到外部服务，完全绕过服务代理。出于这个原因，这些类型的服务甚至不会获得集群IP。
+> **注意**
+> CNAME记录指向完全限定的域名而不是数字IP地址。
