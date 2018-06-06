@@ -434,3 +434,64 @@ service创建完成后，pod可以通过`external-service.default.svc.cluster.lo
 `ExternalName` service仅在DNS级别实施 - 为service创建了简单的CNAME DNS记录。因此，连接到服务的客户端将直接连接到外部服务，完全绕过服务代理。出于这个原因，这些类型的服务甚至不会获得集群IP。
 > **注意**
 > CNAME记录指向完全限定的域名而不是数字IP地址。
+##5.3 外部客户请求内部service
+
+到目前为止，只讨论了集群内服务如何被pod使用。但是，你还需要向外部公开某些service 例如前端Web服务器，以便外部客户端可以访问它们，就像图5.5描述的那样
+![图 5.5 将内部service公开给外部的客户端](figures/Figure5.5.png )
+
+有几种方式可以在外部访问service：
+
+* _将service的`type`设置成`NodePort`_ -每个群集节点都会在节点上打开一个端口，对于`NodePort`service，每个集群节点在节点本身（因此得名叫NodePort）上打开一个端口，并将在该端口上接收到的流量重定向到基础服务。该service仅在内部群集IP和端口上才可访问，但也可通过所有节点上的专用端口访问。
+* _将service的`type`设置成`LoadBalance`,`NodePort`类型的一种扩展_ -这使得service可以通过一个专用的负载均衡器来访问，这是由Kubernetes中正在运行的云基础设施提供的。负载均衡器将流量重定向到跨所有节点的节点端口。客户端通过负载均衡器的IP连接到service。
+* _创建一个Ingress资源，这是一个完全不同的机制，通过一个IP地址公开多个service_ -它运行在HTTP层（网络协议第七层），因此可以提供比工作在第4层的service更多的功能。我们将在5.4节介绍Ingress资源
+
+##5.3.1 使用NodePost service
+
+将一组pod公开给外部客户端的第一种方法是创建一个service并将其type设置为`NodePort`。通过创建NodePort服务，可以让Kubernetes在其所有节点上保留一个端口(所有节点上都使用相同的端口号)，并将传入的连接转发给作为服务部分的pods。
+
+这与常规service类似（它们的实际类型是ClusterIP），但是不仅可以通过服务的内部群集IP访问NodePort service，还可以通过任何节点的IP和预留节点端口访问NodePort service。
+
+当尝试与NodePort服务交互时，意义更加重大。
+
+**创建nodeport service**
+
+现在将创建一个NodePort service，以查看如何使用它。下面的清单显示了service的YAML。
+
+代码清单5.11 NodePort service定义：kubia-svc-nodeport.yaml
+
+```
+apiVersion: v1
+kind: Service
+metadata: 
+   name: kubia-nodeport
+spec:
+  type: NodePort                 <------将service的type属性设置成NodePort
+  ports:
+  - port: 80						   <------service集群IP的端口号
+    targetPort: 8080             <------背后pod的目标端口号
+    nodePort: 30123              <------通过集群node的30123端口可以访问该service
+  selector:
+app: kubi
+```
+
+将类型设置为NodePort并指定该service应该绑定到的所有集群节点的节点端口。指定端口不是强制性的。如果忽略它，Kubernetes将选择一个随机端口。
+> **注意**
+> 当在GKE中创建服务时，kubectl打印出一个关于必须配置防火墙规则的警告。接下来的章节讲述如何处理。
+
+**检查你的nodeport service**
+查看service(nodeport service)的基础信息来更好的了解它。
+
+```
+$ kubectl get svc kubia-nodeport
+NAME             CLUSTER-IP       EXTERNAL-IP   PORT(S)        AGE
+kubia-nodeport   10.111.254.223   <nodes>       80:30123/TCP   2m
+```
+看看EXTERNAL-IP列。它显示<节点>，暗示service可通过任何集群节点的IP地址访问。 PORT（S）列显示cluster IP（80）的内部端口和节点端口（30123），可以通过以下地址访问该服务：
+
+* 10.11.254.223:80
+* <1stnode’sIP>:30123
+* <2ndnode’sIP>:30123, 等等
+
+图5.6显示了service暴露在两个集群节点的端口30123上（这适用于在GKE上运行的情况; Minikube只有一个节点，但原理相同）。到达任何一个端口的传入连接将被重定向到一个随机选择的pod，该pod是否是位于接收到连接的节点上是不确定的。
+![图 5.6 外部客户端经过Node1 或者Node2 连接一个NodePort service](figures/Figure5.6.png )
+在第一个node的端口30123收到的连接可以被重定向到第一node个上运行的pod也可能是到第二个node上运行的pod。
